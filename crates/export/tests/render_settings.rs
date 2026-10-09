@@ -1,16 +1,18 @@
 //! Render Settings and Output Module features end to end (through a [`Sink`], so nothing touches
 //! the disk): field rendering and 3:2 pulldown, crop / region of interest / resize, alpha-only
 //! and premultiplied output, the solo and guide-layer overrides, the render log, storage
-//! overflow and PCM audio formats.
+//! overflow, PCM audio formats and the compositor a job renders on.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use effectcraft_color::Label;
+use effectcraft_effects::Buf;
 use effectcraft_export::render_queue::*;
 use effectcraft_export::{Job, JobOptions, Report, Sink, StorageQuota, export};
 use effectcraft_keyframe::{Keyframe, Value};
 use effectcraft_project::{Comp, ItemId, ItemKind, LayerSource, Project, Solid, build};
-use effectcraft_render::NoFootage;
+use effectcraft_render::{Accelerator, AutoPick, FxStep, Image, NoFootage, Renderer};
 use effectcraft_time::{FrameRate, Tick};
 
 const W: u32 = 64;
@@ -43,6 +45,20 @@ fn custom(start: f64, end: f64) -> RenderSettings {
 }
 
 fn run_with(p: &Project, cid: ItemId, s: &RenderSettings, om: &OutputModule, path: &str, options: JobOptions, cancel: bool) -> (Result<Report, String>, Files) {
+    run_on(p, cid, s, om, path, options, None, cancel)
+}
+
+/// [`run_with`] with an accelerator.
+fn run_on(
+    p: &Project,
+    cid: ItemId,
+    s: &RenderSettings,
+    om: &OutputModule,
+    path: &str,
+    options: JobOptions,
+    accel: Option<&dyn Accelerator>,
+    cancel: bool,
+) -> (Result<Report, String>, Files) {
     let files: Files = Default::default();
     let f = files.clone();
     let sink: Box<Sink> = Box::new(move |path: &str, data: Vec<u8>| f.lock().unwrap().push((path.to_string(), data)));
@@ -50,7 +66,7 @@ fn run_with(p: &Project, cid: ItemId, s: &RenderSettings, om: &OutputModule, pat
         project: p,
         footage: &NoFootage,
         expr: None,
-        accel: None,
+        accel,
         comp: cid,
         settings: s,
         output: om,
@@ -401,4 +417,62 @@ fn cancelled_export_removes_only_files_it_opened() {
         }
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A GPU compositor stand-in that renders every frame solid green (the CPU draws the bar and the
+/// block on black) and keeps Auto's timing history.
+#[derive(Default)]
+struct GreenAccel {
+    pick: AutoPick,
+    frames: AtomicUsize,
+}
+
+impl Accelerator for GreenAccel {
+    fn name(&self) -> String {
+        "green".into()
+    }
+    fn comp_frame(&self, r: &Renderer, comp: ItemId, _t: Tick) -> Option<Image> {
+        self.frames.fetch_add(1, Ordering::SeqCst);
+        let c = r.project.comp(comp)?;
+        Some(Image::filled(c.width, c.height, [0.0, 1.0, 0.0, 1.0]))
+    }
+    fn supports_effect(&self, _id: &str) -> bool {
+        false
+    }
+    fn effects(&self, _chain: &[FxStep], _buf: &Buf, _levels: Option<f32>) -> Option<Buf> {
+        None
+    }
+    fn auto_pick(&self) -> Option<&AutoPick> {
+        Some(&self.pick)
+    }
+}
+
+#[test]
+fn a_job_renders_on_one_compositor() {
+    // #414: Auto chose the CPU or the GPU for each frame from measured frame times, so GPU
+    // renders of the same frames differed run to run. A job renders every frame on the
+    // project's renderer.
+    let (mut p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let om = OutputModule::for_format(OutputFormat::PngSequence);
+    let s = custom(0.0, 0.4);
+    let render = |p: &Project, accel: &GreenAccel, path: &str| {
+        let (r, files) = run_on(p, cid, &s, &om, path, JobOptions::default(), Some(accel), false);
+        r.expect("export");
+        (0..10).map(|i| png(&files, i)).collect::<Vec<_>>()
+    };
+    // Mercury GPU Acceleration: every frame on the GPU, the same in every run.
+    p.settings.gpu_acceleration = true;
+    let gpu = GreenAccel::default();
+    let a = render(&p, &gpu, "/g/a_[#####].png");
+    assert_eq!(gpu.frames.load(Ordering::SeqCst), 10);
+    for (i, f) in a.iter().enumerate() {
+        assert!(f.pixels().all(|px| px.0 == [0, 255, 0, 255]), "frame {i} rendered on the CPU");
+    }
+    assert_eq!(a, render(&p, &gpu, "/g/b_[#####].png"));
+    // Mercury Software Only: every frame on the CPU.
+    p.settings.gpu_acceleration = false;
+    let cpu = GreenAccel::default();
+    let c = render(&p, &cpu, "/g/c_[#####].png");
+    assert_eq!(cpu.frames.load(Ordering::SeqCst), 0);
+    assert_eq!(c[0].get_pixel(10, 44).0, [255, 0, 0, 255], "the CPU drew the red block");
 }

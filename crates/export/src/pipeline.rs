@@ -9,7 +9,7 @@ use effectcraft_project::render_queue::{
 };
 use effectcraft_project::{Comp, Project};
 use effectcraft_raster::Image;
-use effectcraft_render::{LayerCache, RenderOpts, Renderer};
+use effectcraft_render::{Backend, LayerCache, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 use web_time::Instant;
 
@@ -87,6 +87,10 @@ impl<'a> Cx<'a> {
     /// and layer cache.
     fn renderer(&self) -> Renderer<'_> {
         let s = self.job.settings;
+        // The whole job renders on the project's renderer (Mercury GPU Acceleration or Software
+        // Only), not on whichever compositor Auto timed faster for each frame: the CPU and GPU
+        // compositors differ slightly, so a per-frame choice made renders differ run to run.
+        let backend = if self.project.settings.gpu_acceleration { Backend::Gpu } else { Backend::Cpu };
         let opts = RenderOpts {
             scale: s.resolution.clamp(0.01, 4.0),
             motion_blur: s.motion_blur_override() != SwitchOverride::OffForAll,
@@ -94,7 +98,7 @@ impl<'a> Cx<'a> {
             draft: s.quality == RenderQuality::Draft,
             // Output renders always look through the comp's active camera.
             view: None,
-            backend: effectcraft_render::Backend::Auto,
+            backend,
             roi: None,
             nested_switches: self.job.nested_switches,
             draft_shadows: true,

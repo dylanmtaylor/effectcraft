@@ -31,6 +31,7 @@ log = { workspace = true }
 
 [dev-dependencies]
 effectcraft-media = { workspace = true }
+effectcraft-effects = { workspace = true }
 effectcraft-color = { workspace = true }
 filmcraft-opus = { workspace = true }
 filmcraft-vp9 = { workspace = true }

@@ -82,8 +82,8 @@ fn render_queue_jobs_render_on_the_worker_gpu() {
     let done = |r: &[WorkerReply]| r.iter().any(|r| matches!(r, WorkerReply::Item { update } if format!("{update:?}").contains("Done")));
     assert!(done(&cpu_replies) && done(&gpu_replies), "{gpu_replies:?}");
     assert!(matches!(gpu_replies.last(), Some(WorkerReply::Done)));
-    // Backend Auto (what renders use) warms up both sides, GPU first: the GPU frames rendered
-    // in passes on the device (their chains, then the frame read back).
+    // Every frame renders on the project's renderer, the GPU: in passes on the device (their
+    // chains, then the frame read back).
     let frames = gpu_files.len() as u64;
     assert_eq!(frames, 6);
     assert!(after.0 - before.0 >= 6, "passes {before:?} → {after:?}");

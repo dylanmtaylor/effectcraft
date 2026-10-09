@@ -75,7 +75,8 @@ pub struct Job<'a> {
     pub project: &'a Project,
     pub footage: &'a dyn FootageSource,
     pub expr: Option<&'a dyn ExprHost>,
-    /// GPU compositor: used when the project's renderer is Mercury GPU Acceleration.
+    /// GPU compositor: used for every frame of the job when the project's renderer is Mercury
+    /// GPU Acceleration (frames it declines render on the CPU).
     pub accel: Option<&'a dyn effectcraft_render::Accelerator>,
     pub comp: ItemId,
     pub settings: &'a RenderSettings,

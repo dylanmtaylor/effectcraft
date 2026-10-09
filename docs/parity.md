@@ -289,7 +289,8 @@ axes since M13.6; Advanced 3D's DOF has iris shapes since M13.8).
   footprint is now cached and uploaded once).
 - **Auto picks per comp**: `Backend::Auto` (Mercury GPU Acceleration) times each comp on both
   compositors (`render::AutoPick`: per comp, scale and path; warm-up, capped stalls, re-probe
-  every 48 frames) and renders on the faster one, in renders and in the viewer. A light comp
+  every 48 frames) and renders on the faster one, in the viewer and previews (a Render Queue
+  job renders every frame on the project's renderer, so its runs don't differ by timing). A light comp
   stays on the CPU, which composites only the layers' bounds: Lower Third Auto 0.8 ms/frame
   (CPU warm 1.7, GPU warm 4.1, which is mostly the 32 MB readback).
 - **GPU ports (EFF-5)**: Warp, Bezier Warp, Reshape, Smear, CC Bend It, CC Page Turn, Cartoon,

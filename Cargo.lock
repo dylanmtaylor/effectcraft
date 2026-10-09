@@ -1252,6 +1252,7 @@ version = "0.6.0"
 dependencies = [
  "effectcraft-av1enc",
  "effectcraft-color",
+ "effectcraft-effects",
  "effectcraft-hevcenc",
  "effectcraft-keyframe",
  "effectcraft-media",
