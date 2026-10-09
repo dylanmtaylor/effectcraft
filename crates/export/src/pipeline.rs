@@ -9,17 +9,21 @@ use effectcraft_project::render_queue::{
 };
 use effectcraft_project::{Comp, Project};
 use effectcraft_raster::Image;
-use effectcraft_render::{RenderOpts, Renderer};
+use effectcraft_render::{LayerCache, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 use web_time::Instant;
 
 use crate::{Job, RenderQuality, out};
 
-/// A job being exported: the job, the project with the Render Settings overrides applied, and
-/// per-frame timing for the render log.
+/// A job being exported: the job, the project with the Render Settings overrides applied, the
+/// job's layer cache and per-frame timing for the render log.
 pub(crate) struct Cx<'a> {
     pub job: &'a Job<'a>,
     pub project: Project,
+    /// Processed layer buffers shared by the job's frames, as the viewer's layer cache: static
+    /// and transform-only layers render once per job (the GPU compositor then uploads them
+    /// once). Dropped with the job.
+    cache: LayerCache,
     /// (output frame, seconds) of every rendered frame (Plus Per Frame Info logs).
     pub frame_times: Option<Mutex<Vec<(u64, f64)>>>,
     /// Files written to an overflow folder.
@@ -69,14 +73,19 @@ impl<'a> Cx<'a> {
         let mut project = job.project.clone();
         apply_overrides(&mut project, job);
         let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
-        Cx { job, project, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
+        let cache = LayerCache::default();
+        // With deferred readbacks, buffers computed from a missed pass's placeholders are not kept.
+        cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
+        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
     }
 
     pub fn comp(&self) -> Option<&Comp> {
         self.project.comp(self.job.comp)
     }
 
-    async fn render_at(&self, t: Tick) -> Image {
+    /// The renderer of the job's frames: the Render Settings' options, the job's accelerator
+    /// and layer cache.
+    fn renderer(&self) -> Renderer<'_> {
         let s = self.job.settings;
         let opts = RenderOpts {
             scale: s.resolution.clamp(0.01, 4.0),
@@ -94,8 +103,13 @@ impl<'a> Cx<'a> {
         let mut r = Renderer::new(&self.project, self.job.footage, opts);
         r.expr = self.job.expr;
         r.accel = self.job.accel;
+        r.cache = Some(&self.cache);
+        r
+    }
+
+    async fn render_at(&self, t: Tick) -> Image {
         // With deferred GPU readbacks (a browser worker) the frame renders in passes.
-        effectcraft_render::passes::comp_frame(&r, self.job.comp, t).await
+        effectcraft_render::passes::comp_frame(&self.renderer(), self.job.comp, t).await
     }
 
     /// Whether frames render in passes (an accelerator with deferred readbacks).
@@ -349,6 +363,56 @@ fn premultiplied8(img: &Image) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layers_render_once_per_job() {
+        // #413: a job rendered every layer of every frame from scratch (no layer cache).
+        use effectcraft_color::Label;
+        use effectcraft_keyframe::{Keyframe, Value};
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_project::{ItemKind, LayerSource, Solid, build};
+        use effectcraft_render::NoFootage;
+        use effectcraft_time::FrameRate;
+        // A solid animated only in Transform: its pixels render once, then move.
+        let mut p = Project::default();
+        let mut comp = Comp::new(64, 48, FrameRate::FPS_25, Tick::from_seconds_f64(1.0));
+        let sid = p.add_item("Solid", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 16, height: 16, pixel_aspect: 1.0 }));
+        let mut l = build::layer(&mut p, &comp, "Solid", LayerSource::Solid { item: sid }, (16, 16), None);
+        l.props.prop_mut("transform/position").unwrap().keys =
+            vec![Keyframe::new(Tick::ZERO, Value::Vec3([8.0, 24.0, 0.0])), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([56.0, 24.0, 0.0]))];
+        comp.layers.push(l);
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        let (settings, output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::PngSequence));
+        let job = Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: "/c/f_[#####].png",
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+        let cx = Cx::new(&job);
+        let comp = cx.comp().unwrap();
+        cx.frame(comp, 0);
+        let renders = cx.cache.stats().misses;
+        assert!(renders > 0);
+        for i in 1..10 {
+            let img = cx.frame(comp, i);
+            // The frames are the ones rendered without a cache.
+            let t = settings.frame_time(comp, i);
+            let mut uncached = cx.renderer();
+            uncached.cache = None;
+            assert_eq!(img.data, uncached.comp_frame(cid, t).data, "frame {i}");
+        }
+        let stats = cx.cache.stats();
+        assert_eq!(stats.misses, renders, "the solid rendered on the first frame only");
+        assert!(stats.hits >= 9, "{stats:?}");
+    }
 
     #[test]
     fn interleave_takes_alternate_lines() {

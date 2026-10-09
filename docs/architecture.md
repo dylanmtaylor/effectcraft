@@ -161,7 +161,8 @@ collapsed 3D precomps (drawn flattened), morph targets, extruded strokes.
 
 A **layer cache** keeps each layer's finished pixels (source, masks and effects) keyed by a hash of
 its evaluated inputs, excluding the transform. Static and transform-only layers render once;
-editing one layer re-renders only that layer. Effects that read the clock directly are declared in
+editing one layer re-renders only that layer. Each Render Queue job keeps its own layer cache
+for its frames. Effects that read the clock directly are declared in
 `effects::TIME_DEPENDENT`, and a test checks every registered effect against that list.
 
 The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by project
