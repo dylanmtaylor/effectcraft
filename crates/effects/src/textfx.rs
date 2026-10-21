@@ -290,18 +290,16 @@ const DAYS: [&str; 7] = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday",
 
 /// Proleptic Gregorian date from a day count since 2000-01-01 (a Saturday).
 fn date_from_days(days: i64) -> (i64, u32, u32, usize) {
-    // Days since 0000-03-01 based civil calendar conversion.
-    let z = days + 730_425; // 2000-01-01 relative to 0000-03-01
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d, days.rem_euclid(7) as usize)
+    use chrono::Datelike;
+    // 2000-01-01 is 10_957 days after the Unix epoch; chrono does the calendar conversion.
+    let date = days
+        .checked_add(10_957)
+        .and_then(|d| i64::checked_mul(d, 86_400))
+        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .map(|t| t.date_naive())
+        .unwrap_or_default();
+    // Weekday keeps its own modulo (DAYS starts on Saturday, as 2000-01-01 is): not a calendar conversion.
+    (i64::from(date.year()), date.month(), date.day(), days.rem_euclid(7) as usize)
 }
 
 fn timecode(frames: i64, fps: f64) -> String {

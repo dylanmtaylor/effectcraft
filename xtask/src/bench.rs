@@ -655,19 +655,10 @@ fn iso_now() -> String {
     utc(unix_now())
 }
 
-/// `YYYY-MM-DD HH:MM UTC` for a Unix time (civil-from-days, no time zone database).
+/// `YYYY-MM-DD HH:MM UTC` for a Unix time.
 fn utc(t: u64) -> String {
-    let (days, secs) = ((t / 86_400) as i64, t % 86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", secs / 3600, secs % 3600 / 60)
+    let dt = i64::try_from(t).ok().and_then(|s| chrono::DateTime::from_timestamp(s, 0)).unwrap_or_default();
+    dt.format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
 #[allow(clippy::too_many_arguments)]

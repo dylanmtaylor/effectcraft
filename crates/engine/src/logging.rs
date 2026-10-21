@@ -95,26 +95,9 @@ fn thread_name() -> String {
 
 /// `2026-10-08T07:59:17.728Z` (UTC, milliseconds) for `ms` milliseconds since 1970.
 fn timestamp(ms: u64) -> String {
-    let secs = ms / 1000;
-    let (days, rem) = (secs / 86_400, secs % 86_400);
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z", rem / 3600, rem % 3600 / 60, rem % 60, ms % 1000)
-}
-
-/// Days since 1970-01-01 to a proleptic Gregorian (year, month, day) (Howard Hinnant's
-/// `civil_from_days`, unsigned since the clock is clamped at the epoch). `days` is at most
-/// `u64::MAX / 86_400_000`, so none of the arithmetic below can overflow.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + u64::from(m <= 2);
-    (y, m, d)
+    let (secs, millis) = (ms / 1000, (ms % 1000) as u32);
+    let t = i64::try_from(secs).ok().and_then(|s| chrono::DateTime::from_timestamp(s, millis * 1_000_000)).unwrap_or_default();
+    t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// One log line (without the newline): `<timestamp> <LEVEL> [<thread>] <target>: <message>`.

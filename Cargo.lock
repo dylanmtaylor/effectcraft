@@ -804,6 +804,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1233,6 +1242,7 @@ dependencies = [
 name = "effectcraft-effects"
 version = "0.16.0"
 dependencies = [
+ "chrono",
  "effectcraft-color",
  "effectcraft-geom",
  "effectcraft-keyframe",
@@ -1250,6 +1260,7 @@ dependencies = [
 name = "effectcraft-engine"
 version = "0.16.0"
 dependencies = [
+ "chrono",
  "craft-docpath",
  "effectcraft-color",
  "effectcraft-effects",
@@ -1651,6 +1662,7 @@ dependencies = [
 name = "effectcraft-ui-egui"
 version = "0.16.0"
 dependencies = [
+ "chrono",
  "craft-ui",
  "effectcraft-color",
  "effectcraft-engine",
@@ -6627,6 +6639,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 name = "xtask"
 version = "0.16.0"
 dependencies = [
+ "chrono",
  "serde_json",
  "tempfile",
 ]
