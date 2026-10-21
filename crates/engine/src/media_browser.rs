@@ -264,12 +264,33 @@ pub fn parent(dir: &str) -> Option<String> {
     std::path::Path::new(dir).parent().map(|p| p.to_string_lossy().to_string()).filter(|p| !p.is_empty())
 }
 
-/// Format seconds since the epoch as an ISO 8601 UTC date-time.
+/// Format seconds since the epoch as an ISO 8601 UTC date-time. Years far outside chrono's own
+/// range are preserved (the old hand-rolled conversion kept them) rather than collapsing to the epoch.
 pub fn iso_date(secs: u64) -> String {
-    use chrono::Datelike;
-    let t = i64::try_from(secs).ok().and_then(|s| chrono::DateTime::from_timestamp(s, 0)).unwrap_or_default();
+    let (y, t) = utc_parts(secs);
     // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
-    format!("{:04}-{}", t.year(), t.format("%m-%dT%H:%M:%SZ"))
+    format!("{y:04}-{}", t.format("%m-%dT%H:%M:%SZ"))
+}
+
+/// Unix seconds → (proleptic Gregorian year, the same wall-clock instant moved into chrono's range
+/// by whole 400-year cycles). The Gregorian calendar repeats every 400 years (146_097 days), so
+/// month, day and time of day come from chrono and only the year is carried, which keeps every
+/// input exact instead of collapsing out-of-range years to the epoch. `secs` is `u64`, so `days`
+/// always fits an `i64`.
+fn utc_parts(secs: u64) -> (i64, chrono::NaiveDateTime) {
+    use chrono::Datelike;
+    let (days, sod) = ((secs / 86_400) as i64, (secs % 86_400) as i64);
+    let (cycles, rest) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    // `rest + 719_163` (1970-01-01 is CE day 719_163) is always a valid CE day, and `sod` < 86_400.
+    let date = i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt);
+    let time = u32::try_from(sod).ok().and_then(|s| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, 0));
+    match (date, time) {
+        (Some(d), Some(t)) => {
+            let y = i128::from(d.year()) + i128::from(cycles) * 400;
+            (i64::try_from(y).unwrap_or(i64::MAX), d.and_time(t))
+        }
+        _ => (1970, chrono::NaiveDateTime::default()), // unreachable
+    }
 }
 
 /// File dates and size: (created, modified, size).
@@ -496,5 +517,10 @@ mod tests {
         assert_eq!(iso_date(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso_date(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(iso_date(951_782_400), "2000-02-29T00:00:00Z");
+        // Years far outside chrono's own range are preserved (the old hand-rolled conversion kept
+        // them) rather than collapsing to the epoch.
+        assert_eq!(iso_date(253_402_300_800), "10000-01-01T00:00:00Z");
+        assert_eq!(iso_date(10_000_000_000_000), "318857-05-20T17:46:40Z");
+        assert_eq!(iso_date(u64::MAX), "584554051223-11-09T07:00:15Z");
     }
 }

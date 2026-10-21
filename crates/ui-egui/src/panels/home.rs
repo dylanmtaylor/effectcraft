@@ -67,12 +67,32 @@ pub fn recent_entries(prefs: &effectcraft_engine::prefs::Prefs) -> Vec<RecentEnt
         .collect()
 }
 
-/// `YYYY-MM-DD HH:MM` (UTC) from Unix seconds.
-pub fn format_utc(secs: i64) -> String {
+/// Unix seconds → (proleptic Gregorian year, the same wall-clock instant moved into chrono's range
+/// by whole 400-year cycles). The Gregorian calendar repeats every 400 years (146_097 days), so
+/// month, day and time of day come from chrono and only the year is carried, which keeps every
+/// `i64` exact instead of collapsing out-of-range years to the epoch.
+fn utc_parts(secs: i64) -> (i64, chrono::NaiveDateTime) {
     use chrono::Datelike;
-    let t = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
+    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (cycles, rest) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    // `rest + 719_163` (1970-01-01 is CE day 719_163) is always a valid CE day, and `sod` < 86_400.
+    let date = i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt);
+    let time = u32::try_from(sod).ok().and_then(|s| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, 0));
+    match (date, time) {
+        (Some(d), Some(t)) => {
+            let y = i128::from(d.year()) + i128::from(cycles) * 400;
+            (i64::try_from(y).unwrap_or(if y < 0 { i64::MIN } else { i64::MAX }), d.and_time(t))
+        }
+        _ => (1970, chrono::NaiveDateTime::default()), // unreachable
+    }
+}
+
+/// Unix seconds → `YYYY-MM-DD HH:MM` (UTC). Years far outside chrono's own range are preserved
+/// (the old hand-rolled conversion kept them) rather than collapsing to the epoch.
+pub fn format_utc(secs: i64) -> String {
+    let (y, t) = utc_parts(secs);
     // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
-    format!("{:04}-{}", t.year(), t.format("%m-%d %H:%M"))
+    format!("{y:04}-{}", t.format("%m-%d %H:%M"))
 }
 
 /// How long ago `then` was, as the Home screen's Opened column shows it ("3 hours ago", then the
@@ -502,6 +522,12 @@ mod tests {
         assert_eq!(format_utc(0), "1970-01-01 00:00");
         assert_eq!(format_utc(1_790_000_000), "2026-09-21 14:13");
         assert_eq!(format_utc(951_782_400), "2000-02-29 00:00");
+        // Years far outside chrono's own range are preserved (the old hand-rolled conversion kept
+        // them), including negatives and the i64 extremes, rather than collapsing to the epoch.
+        assert_eq!(format_utc(10_000_000_000_000), "318857-05-20 17:46");
+        assert_eq!(format_utc(-10_000_000_000_000), "-314918-08-13 06:13");
+        assert_eq!(format_utc(i64::MAX), "292277026596-12-04 15:30");
+        assert_eq!(format_utc(i64::MIN), "-292277022657-01-27 08:29");
         let img = egui::ColorImage::new([200, 100], vec![Color32::from_rgb(10, 200, 30); 200 * 100]);
         let text = encode_thumb(&img);
         let back = decode_thumb(&text).unwrap();

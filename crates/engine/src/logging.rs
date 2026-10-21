@@ -93,13 +93,34 @@ fn thread_name() -> String {
     return "main".to_string();
 }
 
-/// `2026-10-08T07:59:17.728Z` (UTC, milliseconds) for `ms` milliseconds since 1970.
+/// `2026-10-08T07:59:17.728Z` (UTC, milliseconds) for `ms` milliseconds since 1970. A clock set
+/// absurdly far ahead keeps its real year (preserved) instead of reading as the epoch.
 fn timestamp(ms: u64) -> String {
-    use chrono::Datelike;
     let (secs, millis) = (ms / 1000, (ms % 1000) as u32);
-    let t = i64::try_from(secs).ok().and_then(|s| chrono::DateTime::from_timestamp(s, millis * 1_000_000)).unwrap_or_default();
+    let (y, t) = utc_parts(secs, millis * 1_000_000);
     // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
-    format!("{:04}-{}", t.year(), t.format("%m-%dT%H:%M:%S%.3fZ"))
+    format!("{y:04}-{}", t.format("%m-%dT%H:%M:%S%.3fZ"))
+}
+
+/// Unix seconds (+ nanos) → (proleptic Gregorian year, the same wall-clock instant moved into
+/// chrono's range by whole 400-year cycles). The Gregorian calendar repeats every 400 years
+/// (146_097 days), so month, day and time of day come from chrono and only the year is carried,
+/// which keeps every input exact instead of collapsing out-of-range years to the epoch. `secs` is
+/// `u64` (the clock is clamped at the epoch before 1970), so `days` always fits an `i64`.
+fn utc_parts(secs: u64, nanos: u32) -> (i64, chrono::NaiveDateTime) {
+    use chrono::Datelike;
+    let (days, sod) = ((secs / 86_400) as i64, (secs % 86_400) as i64);
+    let (cycles, rest) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    // `rest + 719_163` (1970-01-01 is CE day 719_163) is always a valid CE day, and `sod` < 86_400.
+    let date = i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt);
+    let time = u32::try_from(sod).ok().and_then(|s| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, nanos.min(999_999_999)));
+    match (date, time) {
+        (Some(d), Some(t)) => {
+            let y = i128::from(d.year()) + i128::from(cycles) * 400;
+            (i64::try_from(y).unwrap_or(i64::MAX), d.and_time(t))
+        }
+        _ => (1970, chrono::NaiveDateTime::default()), // unreachable
+    }
 }
 
 /// One log line (without the newline): `<timestamp> <LEVEL> [<thread>] <target>: <message>`.
@@ -345,8 +366,10 @@ mod tests {
         assert_eq!(timestamp(1_767_225_599_000), "2025-12-31T23:59:59.000Z");
         // Years past 9999 keep the plain zero-padded year (no `+`).
         assert_eq!(timestamp(253_402_300_800_000), "10000-01-01T00:00:00.000Z");
-        // A clock absurdly far ahead reads as the epoch instead of panicking.
-        assert_eq!(timestamp(u64::MAX), "1970-01-01T00:00:00.000Z");
+        // A clock absurdly far ahead keeps its real year (years far outside chrono's own range are
+        // preserved) instead of collapsing to the epoch (reviewer rule from the sibling PRs).
+        assert_eq!(timestamp(10_000_000_000_000_000), "318857-05-20T17:46:40.000Z");
+        assert_eq!(timestamp(u64::MAX), "584556019-04-03T14:25:51.615Z");
     }
 
     /// Each launch keeps the previous runs' logs, so the log of a run that crashed survives.

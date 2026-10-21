@@ -655,12 +655,25 @@ fn iso_now() -> String {
     utc(unix_now())
 }
 
-/// `YYYY-MM-DD HH:MM UTC` for a Unix time.
+/// `YYYY-MM-DD HH:MM UTC` for a Unix time. Years far outside chrono's own range are preserved
+/// (the old hand-rolled conversion kept them) rather than collapsing to the epoch.
 fn utc(t: u64) -> String {
     use chrono::Datelike;
-    let dt = i64::try_from(t).ok().and_then(|s| chrono::DateTime::from_timestamp(s, 0)).unwrap_or_default();
+    // Reduce by whole 400-year Gregorian cycles (146_097 days) into chrono's range, convert the
+    // remainder with chrono, and carry the year back; `t` is `u64`, so `days` fits an `i64`.
+    let (days, sod) = ((t / 86_400) as i64, (t % 86_400) as i64);
+    let (cycles, rest) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    let date = i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt);
+    let time = u32::try_from(sod).ok().and_then(|s| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, 0));
+    let (y, dt) = match (date, time) {
+        (Some(d), Some(ti)) => {
+            let yy = i128::from(d.year()) + i128::from(cycles) * 400;
+            (i64::try_from(yy).unwrap_or(i64::MAX), d.and_time(ti))
+        }
+        _ => (1970, chrono::NaiveDateTime::default()),
+    };
     // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
-    format!("{:04}-{}", dt.year(), dt.format("%m-%d %H:%M UTC"))
+    format!("{y:04}-{}", dt.format("%m-%d %H:%M UTC"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1087,6 +1100,17 @@ fn compare_table(old: &BTreeMap<String, Value>, new: &BTreeMap<String, Value>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_preserves_out_of_range_years() {
+        assert_eq!(utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(utc(1_700_000_000), "2023-11-14 22:13 UTC");
+        // Years far outside chrono's own range are preserved (the old hand-rolled conversion kept
+        // them) rather than collapsing to the epoch.
+        assert_eq!(utc(253_402_300_800), "10000-01-01 00:00 UTC");
+        assert_eq!(utc(10_000_000_000_000), "318857-05-20 17:46 UTC");
+        assert_eq!(utc(u64::MAX), "584554051223-11-09 07:00 UTC");
+    }
 
     const BSD: &str = "        0.33 real         0.67 user         0.15 sys
            743882752  maximum resident set size
