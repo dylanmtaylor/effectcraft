@@ -288,22 +288,39 @@ fn look_from(ctx: &EffectCtx, b: &Buf, on_original_id: &str) -> TextLook {
 const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const DAYS: [&str; 7] = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
 
-/// Proleptic Gregorian date from a day count since 2000-01-01 (a Saturday). A day count outside
-/// chrono's range reads as the epoch (1970-01-01, a Thursday) for every field, so the weekday
-/// never disagrees with the displayed date.
+/// `num_days_from_ce` of 2000-01-01: the day count since 2000-01-01 (Numbers' date epoch, a
+/// Saturday) rebased so that chrono's `num_days_from_ce` (0001-01-01 is day 1) can convert it.
+const CE_FROM_2000: i64 = 730_120;
+
+/// Days in one 400-year Gregorian cycle; the proleptic calendar repeats after it.
+const DAYS_PER_400_YEARS: i64 = 146_097;
+
+/// Proleptic Gregorian date (year, month, day, Saturday-indexed weekday) from a day count since
+/// 2000-01-01 (a Saturday), for any `i64` count.
+///
+/// chrono's `NaiveDate` stops near ±262143, but Numbers' `value` slider is a plain scalar with
+/// no range guard, so a keyframed count can run past that. The calendar repeats every 400 years,
+/// so chrono converts the day within one cycle and the whole cycles are added back as years (via
+/// i128 so `i64::MIN`/`MAX` can't overflow); the result matches the pre-chrono count for every
+/// year. The weekday comes from the same resolved date, so it can never disagree with it.
 fn date_from_days(days: i64) -> (i64, u32, u32, usize) {
     use chrono::Datelike;
-    // 2000-01-01 is 10_957 days after the Unix epoch; chrono does the calendar conversion.
-    let date = days
-        .checked_add(10_957)
-        .and_then(|d| i64::checked_mul(d, 86_400))
-        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
-        .map(|t| t.date_naive())
-        .unwrap_or_default();
-    // Weekday comes from the same resolved date (DAYS is Saturday-indexed), so a fallback date
-    // can't be paired with the input's weekday.
-    let wd = (date.weekday().num_days_from_sunday() as usize + 1) % 7;
-    (i64::from(date.year()), date.month(), date.day(), wd)
+    let from_ce = i128::from(days) + i128::from(CE_FROM_2000);
+    let (cycles, rest) = (from_ce.div_euclid(i128::from(DAYS_PER_400_YEARS)), from_ce.rem_euclid(i128::from(DAYS_PER_400_YEARS)));
+    // `rest` is 0..146_097, so it is always a valid `num_days_from_ce` day inside chrono's range.
+    let date = i32::try_from(rest).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt);
+    // Unreachable fallback: every `rest` in 0..146_097 converts. 2000-01-01 keeps the epoch's date.
+    let (y, m, d, wd) = match date {
+        Some(date) => {
+            let year = i128::from(date.year()) + cycles * 400;
+            let year = i64::try_from(year).unwrap_or(if year < 0 { i64::MIN } else { i64::MAX });
+            // DAYS is Saturday-indexed; chrono counts from Sunday.
+            let wd = (date.weekday().num_days_from_sunday() as usize + 1) % 7;
+            (year, date.month(), date.day(), wd)
+        }
+        None => (2000, 1, 1, 0),
+    };
+    (y, m, d, wd)
 }
 
 fn timecode(frames: i64, fps: f64) -> String {
@@ -1125,6 +1142,10 @@ mod tests {
         assert_eq!(txt(&[("value", num(255.0)), ("type", Value::Enum(9))], 0.0), "FF");
         assert_eq!(txt(&[("value", num(0.0)), ("type", Value::Enum(6))], 0.0), "01/01/00");
         assert_eq!(txt(&[("value", num(60.0)), ("type", Value::Enum(8))], 0.0), "Wednesday, March 1, 2000");
+        // A keyframed date count past chrono's ±262143 range still renders its real date and a
+        // matching weekday (275790-09-13 is a Monday), not an epoch-derived stand-in.
+        assert_eq!(txt(&[("value", num(100_000_000.0)), ("type", Value::Enum(8))], 0.0), "Monday, September 13, 275790");
+        assert_eq!(txt(&[("value", num(-100_000_000.0)), ("type", Value::Enum(7))], 0.0), "Apr 20, -271791");
         assert_eq!(txt(&[("value", num(1.0)), ("currentTimeDate", Value::Bool(true)), ("decimalPlaces", num(1.0))], 2.0), "3.0");
         assert_ne!(
             txt(&[("value", num(100.0)), ("randomValues", Value::Bool(true))], 0.0),
@@ -1133,16 +1154,25 @@ mod tests {
     }
 
     #[test]
-    fn date_from_days_out_of_range_is_consistent() {
-        // A day count chrono can't represent falls back to the epoch (1970-01-01, a Thursday) for
-        // every field, so the weekday can't disagree with the displayed date.
-        let (y, m, d, wd) = super::date_from_days(100_000_000);
-        assert_eq!((y, m, d), (1970, 1, 1));
-        assert_eq!(super::DAYS[wd], "Thursday");
-        // A representable day count still resolves correctly (2000-01-01 is a Saturday).
-        let (y, m, d, wd) = super::date_from_days(0);
-        assert_eq!((y, m, d), (2000, 1, 1));
-        assert_eq!(super::DAYS[wd], "Saturday");
+    fn date_from_days_past_chrono_range() {
+        // chrono's NaiveDate stops near ±262143, but Numbers' `value` has no range guard, so a
+        // keyframed day count can run past it. The 400-year cycle keeps the real date (and a
+        // matching weekday) for every count; values from the pre-chrono formula, both directions,
+        // both sides of the 2000-01-01 epoch.
+        for (days, date, day) in [
+            (0_i64, (2000, 1, 1), "Saturday"),
+            (60, (2000, 3, 1), "Wednesday"),
+            (95_015_644, (262143, 12, 31), "Tuesday"), // chrono's last representable date
+            (100_000_000, (275790, 9, 13), "Monday"),  // past it: used to read as the epoch
+            (-96_476_616, (-262145, 12, 31), "Monday"),
+            (-100_000_000, (-271791, 4, 20), "Thursday"),
+        ] {
+            let (y, m, d, wd) = super::date_from_days(days);
+            assert_eq!((y, m, d), date, "days={days}");
+            assert_eq!(super::DAYS[wd], day, "days={days}");
+        }
+        // Extremes don't overflow (i128 intermediates).
+        let _ = (super::date_from_days(i64::MAX), super::date_from_days(i64::MIN));
     }
 
     #[test]
