@@ -657,8 +657,10 @@ fn iso_now() -> String {
 
 /// `YYYY-MM-DD HH:MM UTC` for a Unix time.
 fn utc(t: u64) -> String {
+    use chrono::Datelike;
     let dt = i64::try_from(t).ok().and_then(|s| chrono::DateTime::from_timestamp(s, 0)).unwrap_or_default();
-    dt.format("%Y-%m-%d %H:%M UTC").to_string()
+    // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
+    format!("{:04}-{}", dt.year(), dt.format("%m-%d %H:%M UTC"))
 }
 
 #[allow(clippy::too_many_arguments)]

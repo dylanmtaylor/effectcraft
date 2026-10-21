@@ -288,7 +288,9 @@ fn look_from(ctx: &EffectCtx, b: &Buf, on_original_id: &str) -> TextLook {
 const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const DAYS: [&str; 7] = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
 
-/// Proleptic Gregorian date from a day count since 2000-01-01 (a Saturday).
+/// Proleptic Gregorian date from a day count since 2000-01-01 (a Saturday). A day count outside
+/// chrono's range reads as the epoch (1970-01-01, a Thursday) for every field, so the weekday
+/// never disagrees with the displayed date.
 fn date_from_days(days: i64) -> (i64, u32, u32, usize) {
     use chrono::Datelike;
     // 2000-01-01 is 10_957 days after the Unix epoch; chrono does the calendar conversion.
@@ -298,8 +300,10 @@ fn date_from_days(days: i64) -> (i64, u32, u32, usize) {
         .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
         .map(|t| t.date_naive())
         .unwrap_or_default();
-    // Weekday keeps its own modulo (DAYS starts on Saturday, as 2000-01-01 is): not a calendar conversion.
-    (i64::from(date.year()), date.month(), date.day(), days.rem_euclid(7) as usize)
+    // Weekday comes from the same resolved date (DAYS is Saturday-indexed), so a fallback date
+    // can't be paired with the input's weekday.
+    let wd = (date.weekday().num_days_from_sunday() as usize + 1) % 7;
+    (i64::from(date.year()), date.month(), date.day(), wd)
 }
 
 fn timecode(frames: i64, fps: f64) -> String {
@@ -1126,6 +1130,19 @@ mod tests {
             txt(&[("value", num(100.0)), ("randomValues", Value::Bool(true))], 0.0),
             txt(&[("value", num(100.0)), ("randomValues", Value::Bool(true))], 1.0)
         );
+    }
+
+    #[test]
+    fn date_from_days_out_of_range_is_consistent() {
+        // A day count chrono can't represent falls back to the epoch (1970-01-01, a Thursday) for
+        // every field, so the weekday can't disagree with the displayed date.
+        let (y, m, d, wd) = super::date_from_days(100_000_000);
+        assert_eq!((y, m, d), (1970, 1, 1));
+        assert_eq!(super::DAYS[wd], "Thursday");
+        // A representable day count still resolves correctly (2000-01-01 is a Saturday).
+        let (y, m, d, wd) = super::date_from_days(0);
+        assert_eq!((y, m, d), (2000, 1, 1));
+        assert_eq!(super::DAYS[wd], "Saturday");
     }
 
     #[test]

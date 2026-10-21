@@ -266,8 +266,10 @@ pub fn parent(dir: &str) -> Option<String> {
 
 /// Format seconds since the epoch as an ISO 8601 UTC date-time.
 pub fn iso_date(secs: u64) -> String {
+    use chrono::Datelike;
     let t = i64::try_from(secs).ok().and_then(|s| chrono::DateTime::from_timestamp(s, 0)).unwrap_or_default();
-    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
+    format!("{:04}-{}", t.year(), t.format("%m-%dT%H:%M:%SZ"))
 }
 
 /// File dates and size: (created, modified, size).

@@ -95,9 +95,11 @@ fn thread_name() -> String {
 
 /// `2026-10-08T07:59:17.728Z` (UTC, milliseconds) for `ms` milliseconds since 1970.
 fn timestamp(ms: u64) -> String {
+    use chrono::Datelike;
     let (secs, millis) = (ms / 1000, (ms % 1000) as u32);
     let t = i64::try_from(secs).ok().and_then(|s| chrono::DateTime::from_timestamp(s, millis * 1_000_000)).unwrap_or_default();
-    t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
+    format!("{:04}-{}", t.year(), t.format("%m-%dT%H:%M:%S%.3fZ"))
 }
 
 /// One log line (without the newline): `<timestamp> <LEVEL> [<thread>] <target>: <message>`.
@@ -341,7 +343,10 @@ mod tests {
         assert_eq!(timestamp(1_709_164_800_000), "2024-02-29T00:00:00.000Z");
         assert_eq!(timestamp(951_782_400_000), "2000-02-29T00:00:00.000Z");
         assert_eq!(timestamp(1_767_225_599_000), "2025-12-31T23:59:59.000Z");
-        let _ = timestamp(u64::MAX);
+        // Years past 9999 keep the plain zero-padded year (no `+`).
+        assert_eq!(timestamp(253_402_300_800_000), "10000-01-01T00:00:00.000Z");
+        // A clock absurdly far ahead reads as the epoch instead of panicking.
+        assert_eq!(timestamp(u64::MAX), "1970-01-01T00:00:00.000Z");
     }
 
     /// Each launch keeps the previous runs' logs, so the log of a run that crashed survives.

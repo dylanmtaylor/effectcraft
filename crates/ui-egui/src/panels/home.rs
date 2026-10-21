@@ -69,8 +69,10 @@ pub fn recent_entries(prefs: &effectcraft_engine::prefs::Prefs) -> Vec<RecentEnt
 
 /// `YYYY-MM-DD HH:MM` (UTC) from Unix seconds.
 pub fn format_utc(secs: i64) -> String {
+    use chrono::Datelike;
     let t = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
-    t.format("%Y-%m-%d %H:%M").to_string()
+    // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
+    format!("{:04}-{}", t.year(), t.format("%m-%d %H:%M"))
 }
 
 /// How long ago `then` was, as the Home screen's Opened column shows it ("3 hours ago", then the

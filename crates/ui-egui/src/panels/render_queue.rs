@@ -37,8 +37,10 @@ pub fn hms(secs: f64) -> String {
 
 /// Unix seconds → `YYYY-MM-DD hh:mm:ss` (UTC).
 pub fn utc_stamp(unix: u64) -> String {
+    use chrono::Datelike;
     let t = i64::try_from(unix).ok().and_then(|s| chrono::DateTime::from_timestamp(s, 0)).unwrap_or_default();
-    t.format("%Y-%m-%d %H:%M:%S").to_string()
+    // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
+    format!("{:04}-{}", t.year(), t.format("%m-%d %H:%M:%S"))
 }
 
 fn status_color(t: &Tokens, s: &RenderStatus) -> Color32 {
