@@ -86,7 +86,8 @@ pub fn format_ago(now: i64, then: i64) -> String {
         3_600..86_400 => plural(d / 3_600, "{} hour ago", "{} hours ago"),
         86_400..172_800 => tr("Yesterday").to_string(),
         172_800..604_800 => plural(d / 86_400, "{} day ago", "{} days ago"),
-        _ => format_utc(then).get(..10).unwrap_or_default().to_string(),
+        // The date part: up to the space, not a fixed 10 bytes, so a year past 9999 stays whole.
+        _ => format_utc(then).split(' ').next().unwrap_or_default().to_string(),
     }
 }
 
@@ -524,6 +525,8 @@ mod tests {
         assert_eq!(format_ago(now, now + 100), "Just now");
         assert_eq!((format_size(900), format_size(13_000), format_size(3_500_000)), ("900 B".into(), "13 KB".into(), "3.3 MB".into()));
         assert_eq!((kind_of("/a/B.ecproj"), kind_of("c.AEP"), kind_of("x")), ("EffectCraft project", "After Effects project", "Project"));
+        // After a week it is the date, whole even for a five-digit year.
+        assert_eq!(format_ago(i64::MAX, 253_402_300_800), "10000-01-01");
     }
 
     /// The Home screen's own text goes through the interface catalog (#574): the Opened and Kind
