@@ -114,13 +114,13 @@ pub fn encode(values: &[u8]) -> String {
 
 /// Decode [`encode`]'s output (None when malformed or larger than the caller's validated plane).
 pub fn decode_bounded(s: &str, max_len: usize) -> Option<Vec<u8>> {
-    let encoded_limit = max_len.checked_mul(16)?.saturating_add(128);
+    let encoded_limit = max_len.saturating_mul(16).saturating_add(128);
     if s.len() > encoded_limit {
         return None;
     }
     // An alternating byte plane takes at most one value byte and a ten-byte varint per
     // pixel, plus the declared-length varint.
-    let decoded_limit = max_len.checked_mul(11)?.checked_add(10)?;
+    let decoded_limit = max_len.saturating_mul(11).saturating_add(10);
     let data = base64_decode_bounded(s, decoded_limit)?;
     let mut pos = 0;
     let n = usize::try_from(get(&data, &mut pos)?).ok()?;

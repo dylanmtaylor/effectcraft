@@ -277,6 +277,9 @@ impl FrameSeg {
                 while i + n < plane.len() && plane[i + n] == v && n < u16::MAX as usize {
                     n += 1;
                 }
+                if out.try_reserve(3).is_err() {
+                    return Vec::new();
+                }
                 out.extend_from_slice(&(n as u16).to_le_bytes());
                 out.push(v);
                 i += n;
@@ -300,6 +303,10 @@ impl FrameSeg {
         let models = b.get(16..models_end)?;
         let (fg, bg): (Gmm, Gmm) = serde_json::from_slice(models).ok()?;
         let mut rest = b.get(models_end..)?;
+        // Each run covers at most u16::MAX pixels; refuse before reserving a plane the input can't fill.
+        if rest.len() < n.div_ceil(usize::from(u16::MAX)).saturating_mul(6) {
+            return None;
+        }
         let mut plane = || -> Option<Vec<u8>> {
             let mut v = Vec::new();
             v.try_reserve_exact(n).ok()?;
