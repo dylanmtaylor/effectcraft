@@ -697,23 +697,35 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
     }
     // advance per char byte (cluster start)
     let mut char_adv = vec![0.0f32; text.len() + 1];
+    let mut variation_ids = vec![0u32; runs.len()];
+    for (i, (_, style)) in runs.iter().enumerate() {
+        variation_ids[i] = crate::variable::intern(&style.variations);
+    }
     for it in &items {
         for g in &it.glyphs {
             char_adv[g.cluster.min(text.len())] += g.adv + g.pre;
         }
     }
-    let range_w = |r: Range<usize>| -> f32 { char_adv[r].iter().sum() };
-    let trailing_ws = |r: &Range<usize>| -> (usize, f32) {
-        let mut end = r.end;
-        let mut w = 0.0;
-        for (b, c) in text[r.clone()].char_indices().rev() {
-            if !c.is_whitespace() {
-                break;
-            }
-            end = r.start + b;
-            w += char_adv[r.start + b];
+    // Prefix widths and the preceding non-whitespace boundary make candidate line widths O(1).
+    // Every-line composition evaluates O(n²) candidate breaks; summing each candidate's bytes
+    // or rescanning its trailing whitespace would otherwise add another factor of text length.
+    let mut prefix_adv = vec![0.0f32; text.len() + 1];
+    for i in 0..text.len() {
+        prefix_adv[i + 1] = prefix_adv[i] + char_adv[i];
+    }
+    let mut previous_non_ws = vec![0usize; text.len() + 1];
+    let mut non_ws_end = 0usize;
+    for (b, c) in text.char_indices() {
+        previous_non_ws[b] = non_ws_end;
+        if !c.is_whitespace() {
+            non_ws_end = b + c.len_utf8();
         }
-        (end, w)
+        previous_non_ws[b + c.len_utf8()] = non_ws_end;
+    }
+    let range_w = |r: Range<usize>| -> f32 { prefix_adv[r.end] - prefix_adv[r.start] };
+    let trailing_ws = |r: &Range<usize>| -> (usize, f32) {
+        let end = previous_non_ws[r.end].max(r.start).min(r.end);
+        (end, prefix_adv[r.end] - prefix_adv[end])
     };
     // Hanging punctuation widths (left, right) of a line's content.
     let hang_of = |r: &Range<usize>, ce: usize| -> (f32, f32) {
@@ -824,7 +836,8 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
         let mut underline: Option<(f32, f32)> = None;
         for run in vruns {
             let rtl = levels[run.start].is_rtl();
-            let mut idx: Vec<usize> = (0..items.len()).filter(|&k| items[k].range.start < run.end && items[k].range.end > run.start).collect();
+            let run_limit = items.partition_point(|item| item.range.start < run.end);
+            let mut idx: Vec<usize> = items[..run_limit].iter().enumerate().filter(|(_, item)| item.range.end > run.start).map(|(k, _)| k).collect();
             if rtl {
                 idx.reverse();
             }
@@ -845,7 +858,7 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
                         h_scale: st.h_scale,
                         v_scale: st.v_scale,
                         run: g.run,
-                        variations: crate::variable::intern(&st.variations),
+                        variations: variation_ids[g.run],
                     });
                     pen += g.adv;
                     if space_extra > 0.0 && text[g.cluster..].starts_with(' ') && g.cluster < ce {
@@ -862,18 +875,25 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
                 }
             }
         }
-        // caret stops for each char boundary in the line
+        // Caret stops for each char boundary in the line.
         let mut carets = Vec::new();
         let mut cluster_starts: Vec<usize> = extents.keys().copied().collect();
         cluster_starts.sort_unstable();
         let char_bytes: Vec<usize> = text[r.clone()].char_indices().map(|(b, _)| r.start + b).collect();
+        let mut char_index = 0usize;
         for (ci, &cs) in cluster_starts.iter().enumerate() {
             let (x0, x1, rtl) = extents[&cs];
             let next = cluster_starts.get(ci + 1).copied().unwrap_or(r.end);
-            let members: Vec<usize> = char_bytes.iter().copied().filter(|b| *b >= cs && *b < next).collect();
-            let n = members.len().max(1) as f32;
-            for (mi, b) in members.iter().enumerate() {
-                let f = mi as f32 / n;
+            while char_index < char_bytes.len() && char_bytes[char_index] < cs {
+                char_index += 1;
+            }
+            let begin = char_index;
+            while char_index < char_bytes.len() && char_bytes[char_index] < next {
+                char_index += 1;
+            }
+            let count = (char_index - begin).max(1) as f32;
+            for (mi, b) in char_bytes[begin..char_index].iter().enumerate() {
+                let f = mi as f32 / count;
                 let x = if rtl { x1 - (x1 - x0) * f } else { x0 + (x1 - x0) * f };
                 carets.push((base + b, x));
             }
@@ -900,7 +920,9 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
         carets.dedup_by_key(|c| c.0);
         // Line metrics: the tallest face and the largest leading on the line.
         let (mut asc, mut desc, mut adv) = (0.0f32, 0.0f32, 0.0f32);
-        let mut seen: Vec<usize> = chars.iter().filter(|c| c.0 >= r.start && c.0 < r.end).map(|c| c.6).collect();
+        let char_start = chars.partition_point(|c| c.0 < r.start);
+        let char_end = chars.partition_point(|c| c.0 < r.end);
+        let mut seen: Vec<usize> = chars[char_start..char_end].iter().map(|c| c.6).collect();
         seen.sort_unstable();
         seen.dedup();
         if seen.is_empty() {
@@ -945,10 +967,17 @@ pub fn layout_uncached(text: &str, style: &TextStyle, para: &ParagraphStyle) -> 
     layout_rich_uncached(text, &[(0..text.len(), style.clone())], std::slice::from_ref(para))
 }
 
+/// Maximum input size processed by one layout request. Above this, return an empty layout
+/// retaining the source length, so untrusted text cannot fan out into unbounded shaped data.
+const MAX_LAYOUT_BYTES: usize = 1 << 20;
+
 /// Lay out `text` with character style runs (byte ranges covering the text, in order; at least
 /// one) and paragraph settings (one per CR/LF/CRLF-separated paragraph; the last repeats). The wrap
 /// width is the first paragraph's.
 pub fn layout_rich_uncached(text: &str, runs: &[(Range<usize>, TextStyle)], paras: &[ParagraphStyle]) -> Layout {
+    if text.len() > MAX_LAYOUT_BYTES || runs.len() > MAX_LAYOUT_BYTES || paras.len() > MAX_LAYOUT_BYTES {
+        return Layout { text_len: text.len(), ..Default::default() };
+    }
     let fallback = [(0..text.len(), TextStyle::default())];
     let runs = if runs.is_empty() { &fallback[..] } else { runs };
     let default_para = ParagraphStyle::default();
@@ -1067,6 +1096,9 @@ pub fn layout_rich(text: &str, runs: &[(Range<usize>, TextStyle)], paras: &[Para
     let key = h.finish();
     static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if text.len() > MAX_LAYOUT_BYTES || runs.len() > MAX_LAYOUT_BYTES || paras.len() > MAX_LAYOUT_BYTES {
+        return Arc::new(layout_rich_uncached(text, runs, paras));
+    }
     if let Some(e) = cache().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&key) {
         e.0 = now;
         return e.1.clone();
@@ -1413,6 +1445,15 @@ mod tests {
             &[ParagraphStyle { width: Some(400.0), hanging: true, align: Align::Right, ..Default::default() }],
         );
         assert!(r.lines[0].x + r.lines[0].width > 401.0, "closing quote hangs right");
+    }
+
+    #[test]
+    fn oversized_layout_requests_are_bounded_without_caching() {
+        let text = "a".repeat(MAX_LAYOUT_BYTES + 1);
+        let layout = layout(&text, &TextStyle::default(), &ParagraphStyle::default());
+        assert_eq!(layout.text_len, text.len());
+        assert!(layout.lines.is_empty() && layout.glyphs.is_empty());
+        assert!(layout_rich_uncached("ok", &[], &[]).lines.len() == 1);
     }
 
     #[test]
