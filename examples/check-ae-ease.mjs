@@ -5,11 +5,15 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const cli = process.argv[2];
-if (!cli || !fs.existsSync(cli)) throw new Error('Usage: node examples/check-ae-ease.mjs <aesync/server/dist/cli.js>');
+const cli = path.resolve(process.argv[2] ?? '');
+if (!process.argv[2] || !fs.statSync(cli, { throwIfNoEntry: false })?.isFile()) {
+  throw new Error('Usage: node examples/check-ae-ease.mjs <aesync/server/dist/cli.js>');
+}
 const tolerance = 1e-7;
 function run(command, args) {
-  const result = spawnSync(command, args, { cwd: root, windowsHide: true, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  // A developer-run comparison script; spawnSync never uses a shell and every command is either
+  // a fixed binary (`cargo`, `process.execPath`) or the CLI script path validated above.
+  const result = spawnSync(command, args, { cwd: root, windowsHide: true, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }); // NOSONAR
   if (result.status !== 0) throw new Error(result.stderr || result.stdout || 'Process failed');
   return JSON.parse(result.stdout.replace(/^\uFEFF/, '').trim());
 }
