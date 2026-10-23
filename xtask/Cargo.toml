@@ -7,3 +7,5 @@ publish = false
 
 [dependencies]
 serde_json = { workspace = true }
+
+tempfile = "3"
