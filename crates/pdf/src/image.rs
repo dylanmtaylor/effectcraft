@@ -115,6 +115,11 @@ fn jpeg_decode(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
     use zune_jpeg::zune_core::options::DecoderOptions;
     let mut probe = JpegDecoder::new(std::io::Cursor::new(data));
     probe.decode_headers().map_err(|_| "image (JPEG)".to_string())?;
+    // Bound the header-declared size before decode() allocates the output.
+    let (hw, hh) = probe.dimensions().ok_or_else(|| "image (JPEG)".to_string())?;
+    if hw.checked_mul(hh).is_none_or(|p| p > MAX_PIXELS) {
+        return Err("image (JPEG)".to_string());
+    }
     let n = probe.input_colorspace().map(|c| c.num_components()).unwrap_or(3);
     let out = match n {
         1 => ColorSpace::Luma,
@@ -172,7 +177,12 @@ fn resample(m: &[u8], mw: usize, mh: usize, w: usize, h: usize) -> Vec<u8> {
         return Vec::new();
     }
     if mw == w && mh == h {
-        return m[..pixels].to_vec();
+        let mut out = Vec::new();
+        if out.try_reserve_exact(pixels).is_err() {
+            return Vec::new();
+        }
+        out.extend_from_slice(&m[..pixels]);
+        return out;
     }
     let mut out = Vec::new();
     if out.try_reserve_exact(pixels).is_err() {
@@ -197,9 +207,12 @@ fn mask_image(file: &File, o: &Obj, soft: bool) -> Option<(Vec<u8>, usize, usize
         return None;
     }
     let (data, jpeg_n) = samples(file, d, raw).ok()?;
+    let pixels = w.checked_mul(h)?;
     if jpeg_n.is_some() {
-        let pixels = w.checked_mul(h)?;
-        return Some((data.into_iter().step_by(jpeg_n.unwrap_or(1)).take(pixels).collect(), w, h));
+        let mut out = Vec::new();
+        out.try_reserve_exact(pixels).ok()?;
+        out.extend(data.into_iter().step_by(jpeg_n.unwrap_or(1)).take(pixels));
+        return Some((out, w, h));
     }
     let bpc = if soft { file.get_num(d, "BitsPerComponent").unwrap_or(8.0) as usize } else { 1 };
     // Like `decode()`: only 1/2/4/8/16-bit depths are supported. Anything else (notably
@@ -210,22 +223,21 @@ fn mask_image(file: &File, o: &Obj, soft: bool) -> Option<(Vec<u8>, usize, usize
     let max = ((1u32 << bpc) - 1).max(1) as f64;
     let dec = file.get(d, "Decode").map(|x| file.nums(x)).filter(|v| v.len() >= 2);
     let v = unpack(&data, w, h, 1, bpc);
-    if v.len() != w.checked_mul(h)? {
+    if v.len() != pixels {
         return None;
     }
-    let out = v
-        .into_iter()
-        .map(|s| {
-            let t = s as f64 / max;
-            let t = match &dec {
-                Some(dd) => dd[0] + t * (dd[1] - dd[0]),
-                None => t,
-            };
-            // Explicit (stencil) masks: sample 1 masks out with the default Decode.
-            let a = if soft { t } else { 1.0 - t };
-            (a.clamp(0.0, 1.0) * 255.0).round() as u8
-        })
-        .collect();
+    let mut out = Vec::new();
+    out.try_reserve_exact(pixels).ok()?;
+    out.extend(v.into_iter().map(|s| {
+        let t = s as f64 / max;
+        let t = match &dec {
+            Some(dd) => dd[0] + t * (dd[1] - dd[0]),
+            None => t,
+        };
+        // Explicit (stencil) masks: sample 1 masks out with the default Decode.
+        let a = if soft { t } else { 1.0 - t };
+        (a.clamp(0.0, 1.0) * 255.0).round() as u8
+    }));
     Some((out, w, h))
 }
 
