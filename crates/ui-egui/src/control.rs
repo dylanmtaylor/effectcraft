@@ -331,7 +331,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 if count == 0 || count > MAX_CLICK_COUNT {
                     return err(format!("`count` must be between 1 and {MAX_CLICK_COUNT}"));
                 }
-                let Some(events) = usize::try_from(count).ok().and_then(|n| n.checked_mul(2)).and_then(|n| n.checked_add(4)) else {
+                let Some(events) = usize::try_from(count).ok().and_then(|n| n.checked_mul(2)).and_then(|n| n.checked_add(3)) else {
                     return err("click event count overflow");
                 };
                 events
