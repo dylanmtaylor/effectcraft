@@ -6,6 +6,12 @@
 
 use std::collections::HashMap;
 
+const MAX_ARCHIVE_BYTES: usize = 1 << 30;
+const MAX_PICKLE_OPS: usize = 4_000_000;
+const MAX_TENSORS: usize = 1_000_000;
+const MAX_TENSOR_ELEMENTS: usize = 1 << 28;
+const MAX_TENSOR_DIMS: usize = 64;
+
 /// A tensor read from a checkpoint: its shape and its values as f32 (row-major, contiguous).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
@@ -38,6 +44,9 @@ struct Entry {
 
 /// The entries of a zip archive by name.
 fn zip_entries(b: &[u8]) -> Result<HashMap<String, Entry>> {
+    if b.len() > MAX_ARCHIVE_BYTES {
+        return Err("checkpoint exceeds the 1024 MiB archive limit".into());
+    }
     // End of central directory: the last `PK\x05\x06` (a comment may follow it).
     let eocd =
         (0..b.len().saturating_sub(21)).rev().find(|&i| b.get(i..i + 4) == Some(b"PK\x05\x06")).ok_or("not a zip archive (no end of central directory)")?;
@@ -142,6 +151,30 @@ fn int_list(o: &Obj) -> Option<Vec<usize>> {
     }
 }
 
+fn tensor_element_count(name: &str, offset: usize, size: &[usize], stride: &[usize], values_len: usize) -> Result<usize> {
+    if size.len() != stride.len() || size.len() > MAX_TENSOR_DIMS {
+        return Err(format!("{name}: invalid tensor dimensionality"));
+    }
+    let n = size
+        .iter()
+        .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+        .filter(|n| *n <= MAX_TENSOR_ELEMENTS)
+        .ok_or_else(|| format!("{name}: tensor exceeds the element limit"))?;
+    if n == 0 {
+        return Ok(0);
+    }
+    let mut max_at = offset;
+    for (&dim, &step) in size.iter().zip(stride) {
+        max_at = max_at
+            .checked_add((dim - 1).checked_mul(step).ok_or_else(|| format!("{name}: tensor stride overflow"))?)
+            .ok_or_else(|| format!("{name}: tensor offset overflow"))?;
+    }
+    if max_at >= values_len {
+        return Err(format!("{name}: data out of range"));
+    }
+    Ok(n)
+}
+
 /// Run the pickle program and return its result.
 fn unpickle(p: &[u8]) -> Result<Obj> {
     let mut stack: Vec<Obj> = Vec::new();
@@ -166,7 +199,9 @@ fn unpickle(p: &[u8]) -> Result<Obj> {
         *i += n + 1;
         Ok(s)
     };
+    let mut op_count = 0usize;
     loop {
+        op_count = op_count.checked_add(1).filter(|n| *n <= MAX_PICKLE_OPS).ok_or("pickle exceeds the opcode limit")?;
         let op = *p.get(i).ok_or("truncated pickle")?;
         i += 1;
         match op {
@@ -290,9 +325,10 @@ fn unpickle(p: &[u8]) -> Result<Obj> {
                 stack.push(match f {
                     Obj::Global(m, n) if m == "torch._utils" && n == "_rebuild_tensor_v2" => {
                         match (args.first(), args.get(1), args.get(2).and_then(int_list), args.get(3).and_then(int_list)) {
-                            (Some(Obj::Storage(dtype, key)), Some(Obj::Int(off)), Some(size), Some(stride)) => {
-                                Obj::Tensor { dtype: dtype.clone(), key: key.clone(), offset: usize::try_from(*off).unwrap_or(0), size, stride }
-                            }
+                            (Some(Obj::Storage(dtype, key)), Some(Obj::Int(off)), Some(size), Some(stride)) => match usize::try_from(*off) {
+                                Ok(offset) => Obj::Tensor { dtype: dtype.clone(), key: key.clone(), offset, size, stride },
+                                Err(_) => Obj::Other,
+                            },
                             _ => Obj::Other,
                         }
                     }
@@ -382,6 +418,9 @@ pub fn read(bytes: &[u8]) -> Result<Weights> {
         Some((_, Obj::Dict(inner))) => inner.clone(),
         _ => dict,
     };
+    if dict.len() > MAX_TENSORS {
+        return Err("checkpoint exceeds the tensor count limit".into());
+    }
     let mut storages: HashMap<String, std::borrow::Cow<[u8]>> = HashMap::new();
     let mut out = Weights::new();
     for (k, v) in dict {
@@ -391,12 +430,17 @@ pub fn read(bytes: &[u8]) -> Result<Weights> {
             storages.insert(key.clone(), read_entry(bytes, e)?);
         }
         let Some(values) = storages.get(&key).and_then(|b| to_f32(&dtype, b)) else { continue };
-        let n: usize = size.iter().product();
-        // Gather (any strides) into a contiguous row-major tensor.
-        let mut data = Vec::with_capacity(n);
+        // Check hostile stride math before allocating or indexing the backing storage.
+        let n = tensor_element_count(&name, offset, &size, &stride, values.len())?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(n).map_err(|_| format!("{name}: tensor allocation failed"))?;
         let mut idx = vec![0usize; size.len()];
         for _ in 0..n {
-            let at = offset + idx.iter().zip(&stride).map(|(i, s)| i * s).sum::<usize>();
+            let at = idx
+                .iter()
+                .zip(&stride)
+                .try_fold(offset, |at, (i, s)| i.checked_mul(*s).and_then(|v| at.checked_add(v)))
+                .ok_or_else(|| format!("{name}: tensor offset overflow"))?;
             data.push(*values.get(at).ok_or_else(|| format!("{name}: data out of range"))?);
             for d in (0..idx.len()).rev() {
                 idx[d] += 1;
@@ -488,6 +532,15 @@ mod tests {
         // Strides (1, 2) over [1..6]: rows are [1, 3, 5] and [2, 4, 6].
         assert_eq!(w.get("w"), Some(&Tensor { shape: vec![2, 3], data: vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0] }));
         assert!(!w.contains_key("n"), "integer tensors are skipped");
+    }
+
+    #[test]
+    fn rejects_tensor_shape_overflow_and_invalid_strides() {
+        assert!(tensor_element_count("bad", 0, &[usize::MAX, 2], &[1, 1], 16).is_err());
+        assert!(tensor_element_count("bad", 0, &[2, 2], &[usize::MAX, 1], 16).is_err());
+        assert!(tensor_element_count("bad", 0, &[2, 2], &[1], 16).is_err());
+        assert!(tensor_element_count("bad", usize::MAX, &[2], &[1], 16).is_err());
+        assert_eq!(tensor_element_count("empty", 0, &[0, usize::MAX], &[0, 0], 0), Ok(0));
     }
 
     #[test]
