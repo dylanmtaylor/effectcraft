@@ -10,6 +10,9 @@ const MAX_ARCHIVE_BYTES: usize = 1 << 30;
 const MAX_PICKLE_OPS: usize = 4_000_000;
 const MAX_TENSORS: usize = 1_000_000;
 const MAX_TENSOR_ELEMENTS: usize = 1 << 28;
+const MAX_ENTRY_BYTES: usize = 1 << 30;
+const MAX_PICKLE_NODES: usize = 4_000_000;
+const MAX_TOTAL_ELEMENTS: usize = 1 << 29;
 const MAX_TENSOR_DIMS: usize = 64;
 
 /// A tensor read from a checkpoint: its shape and its values as f32 (row-major, contiguous).
@@ -105,6 +108,9 @@ fn read_entry<'a>(b: &'a [u8], e: &Entry) -> Result<std::borrow::Cow<'a, [u8]>> 
     match e.method {
         0 => Ok(std::borrow::Cow::Borrowed(raw)),
         8 => {
+            if e.size > MAX_ENTRY_BYTES {
+                return Err("zip entry exceeds the size limit".into());
+            }
             miniz_oxide::inflate::decompress_to_vec_with_limit(raw, e.size.max(1)).map(std::borrow::Cow::Owned).map_err(|e| format!("bad deflate data: {e:?}"))
         }
         m => Err(format!("unsupported zip compression {m}")),
@@ -151,6 +157,23 @@ fn int_list(o: &Obj) -> Option<Vec<usize>> {
     }
 }
 
+/// Nodes in `o`, stopping once the count passes `budget`.
+fn nodes(o: &Obj, budget: usize) -> usize {
+    let kids: Vec<&Obj> = match o {
+        Obj::Tuple(v) | Obj::List(v) => v.iter().collect(),
+        Obj::Dict(v) => v.iter().flat_map(|(k, x)| [k, x]).collect(),
+        _ => return 1,
+    };
+    let mut n = 1;
+    for k in kids {
+        if n > budget {
+            break;
+        }
+        n += nodes(k, budget - n);
+    }
+    n
+}
+
 fn tensor_element_count(name: &str, offset: usize, size: &[usize], stride: &[usize], values_len: usize) -> Result<usize> {
     if size.len() != stride.len() || size.len() > MAX_TENSOR_DIMS {
         return Err(format!("{name}: invalid tensor dimensionality"));
@@ -176,6 +199,16 @@ fn tensor_element_count(name: &str, offset: usize, size: &[usize], stride: &[usi
 }
 
 /// Run the pickle program and return its result.
+/// A memoized object, charged against the clone budget (memo reuse can otherwise grow trees exponentially).
+fn memo_get(memo: &HashMap<u64, Obj>, k: u64, cloned: &mut usize) -> Result<Obj> {
+    let o = memo.get(&k).ok_or("pickle: bad memo")?;
+    *cloned = cloned.saturating_add(nodes(o, MAX_PICKLE_NODES));
+    if *cloned > MAX_PICKLE_NODES {
+        return Err("pickle exceeds the object limit".into());
+    }
+    Ok(o.clone())
+}
+
 fn unpickle(p: &[u8]) -> Result<Obj> {
     let mut stack: Vec<Obj> = Vec::new();
     let mut memo: HashMap<u64, Obj> = HashMap::new();
@@ -200,6 +233,7 @@ fn unpickle(p: &[u8]) -> Result<Obj> {
         Ok(s)
     };
     let mut op_count = 0usize;
+    let mut cloned = 0usize;
     loop {
         op_count = op_count.checked_add(1).filter(|n| *n <= MAX_PICKLE_OPS).ok_or("pickle exceeds the opcode limit")?;
         let op = *p.get(i).ok_or("truncated pickle")?;
@@ -288,11 +322,11 @@ fn unpickle(p: &[u8]) -> Result<Obj> {
             }
             b'h' => {
                 let k = take(&mut i, 1)?[0] as u64;
-                stack.push(memo.get(&k).cloned().ok_or("pickle: bad memo")?);
+                stack.push(memo_get(&memo, k, &mut cloned)?);
             }
             b'j' => {
                 let s = take(&mut i, 4)?;
-                stack.push(memo.get(&(u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64)).cloned().ok_or("pickle: bad memo")?);
+                stack.push(memo_get(&memo, u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64, &mut cloned)?);
             }
             b't' => {
                 let items = pop_mark(&mut stack)?;
@@ -373,13 +407,21 @@ fn unpickle(p: &[u8]) -> Result<Obj> {
     }
 }
 
-/// Element bytes and conversion of a storage dtype.
-fn to_f32(dtype: &str, bytes: &[u8]) -> Option<Vec<f32>> {
+/// Bytes per element of a float storage dtype.
+fn elem_size(dtype: &str) -> Option<usize> {
     match dtype {
-        "FloatStorage" => Some(bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
-        "HalfStorage" => Some(bytes.as_chunks::<2>().0.iter().map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()),
-        "BFloat16Storage" => Some(bytes.as_chunks::<2>().0.iter().map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect()),
+        "FloatStorage" => Some(4),
+        "HalfStorage" | "BFloat16Storage" => Some(2),
         _ => None,
+    }
+}
+
+/// Element `i` of a storage (`i` must be below `bytes.len() / elem_size`).
+fn elem_f32(dtype: &str, bytes: &[u8], i: usize) -> f32 {
+    match dtype {
+        "FloatStorage" => f32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]),
+        "HalfStorage" => half_to_f32(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])),
+        _ => f32::from_bits((u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as u32) << 16),
     }
 }
 
@@ -423,15 +465,20 @@ pub fn read(bytes: &[u8]) -> Result<Weights> {
     }
     let mut storages: HashMap<String, std::borrow::Cow<[u8]>> = HashMap::new();
     let mut out = Weights::new();
+    let mut total = 0usize;
     for (k, v) in dict {
         let (Obj::Str(name), Obj::Tensor { dtype, key, offset, size, stride }) = (k, v) else { continue };
         if !storages.contains_key(&key) {
             let e = entries.get(&format!("{prefix}data/{key}")).ok_or_else(|| format!("missing storage {key}"))?;
             storages.insert(key.clone(), read_entry(bytes, e)?);
         }
-        let Some(values) = storages.get(&key).and_then(|b| to_f32(&dtype, b)) else { continue };
+        let (Some(esz), Some(values)) = (elem_size(&dtype), storages.get(&key)) else { continue };
         // Check hostile stride math before allocating or indexing the backing storage.
-        let n = tensor_element_count(&name, offset, &size, &stride, values.len())?;
+        let n = tensor_element_count(&name, offset, &size, &stride, values.len() / esz)?;
+        total = total.saturating_add(n);
+        if total > MAX_TOTAL_ELEMENTS {
+            return Err("checkpoint exceeds the total element limit".into());
+        }
         let mut data = Vec::new();
         data.try_reserve_exact(n).map_err(|_| format!("{name}: tensor allocation failed"))?;
         let mut idx = vec![0usize; size.len()];
@@ -441,7 +488,7 @@ pub fn read(bytes: &[u8]) -> Result<Weights> {
                 .zip(&stride)
                 .try_fold(offset, |at, (i, s)| i.checked_mul(*s).and_then(|v| at.checked_add(v)))
                 .ok_or_else(|| format!("{name}: tensor offset overflow"))?;
-            data.push(*values.get(at).ok_or_else(|| format!("{name}: data out of range"))?);
+            data.push(elem_f32(&dtype, values, at));
             for d in (0..idx.len()).rev() {
                 idx[d] += 1;
                 if idx[d] < size[d] {
