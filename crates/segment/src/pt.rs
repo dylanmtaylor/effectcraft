@@ -466,10 +466,17 @@ pub fn read(bytes: &[u8]) -> Result<Weights> {
     let mut storages: HashMap<String, std::borrow::Cow<[u8]>> = HashMap::new();
     let mut out = Weights::new();
     let mut total = 0usize;
+    let mut inflated = 0usize;
     for (k, v) in dict {
         let (Obj::Str(name), Obj::Tensor { dtype, key, offset, size, stride }) = (k, v) else { continue };
         if !storages.contains_key(&key) {
             let e = entries.get(&format!("{prefix}data/{key}")).ok_or_else(|| format!("missing storage {key}"))?;
+            if e.method == 8 {
+                inflated = inflated.saturating_add(e.size);
+                if inflated > MAX_ENTRY_BYTES {
+                    return Err("checkpoint exceeds the decompressed storage limit".into());
+                }
+            }
             storages.insert(key.clone(), read_entry(bytes, e)?);
         }
         let (Some(esz), Some(values)) = (elem_size(&dtype), storages.get(&key)) else { continue };
