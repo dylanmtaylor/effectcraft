@@ -229,7 +229,7 @@ fn native_name(b: &[u8], id: u16) -> Option<String> {
 fn name_string(b: &[u8], id: u16) -> Option<String> {
     let count = be16(b, 2)? as usize;
     let storage = be16(b, 4)? as usize;
-    let mut best: Option<(u8, u16, u16, &[u8])> = None;
+    let mut cands: Vec<(u8, u16, u16, &[u8])> = Vec::new();
     for i in 0..count {
         let r = 6usize.checked_add(i.checked_mul(12)?)?;
         let (plat, enc, lang, nid, len, off) =
@@ -252,22 +252,22 @@ fn name_string(b: &[u8], id: u16) -> Option<String> {
             1 if enc == 0 => 3,
             _ => continue,
         };
-        // Select by metadata first. Aliased records must not repeatedly allocate and decode
-        // UTF-16 when a preferred record has already been found.
-        if best.as_ref().is_none_or(|(r0, _, _, _)| rank < *r0) {
-            best = Some((rank, plat, enc, raw));
-        }
+        cands.push((rank, plat, enc, raw));
     }
-    let (_, plat, enc, raw) = best?;
-    let s = match (plat, enc) {
-        (3, 1 | 10) | (0, _) => {
-            let u: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-            String::from_utf16_lossy(&u)
-        }
-        (1, 0) => raw.iter().map(|&c| if c < 128 { c as char } else { '?' }).collect(),
-        _ => return None,
-    };
-    (!s.trim().is_empty()).then_some(s)
+    // Best rank first; a blank record falls through to the next. Decoding is lazy, so aliased
+    // records are not decoded once a usable one is found.
+    cands.sort_by_key(|c| c.0);
+    cands.into_iter().find_map(|(_, plat, enc, raw)| {
+        let s = match (plat, enc) {
+            (3, 1 | 10) | (0, _) => {
+                let u: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                String::from_utf16_lossy(&u)
+            }
+            (1, 0) => raw.iter().map(|&c| if c < 128 { c as char } else { '?' }).collect(),
+            _ => return None,
+        };
+        (!s.trim().is_empty()).then_some(s)
+    })
 }
 
 /// Synthetic font files for tests: just `name` and `fvar`, enough for the scan and the resolver.

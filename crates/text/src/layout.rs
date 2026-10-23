@@ -597,7 +597,7 @@ fn run_at(runs: &[(Range<usize>, TextStyle)], b: usize) -> usize {
 }
 
 /// Lay out one paragraph (no newlines) whose text starts at byte `base` of the whole string.
-fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primaries: &[Resolved], para: &ParagraphStyle, width: Option<f32>) -> Vec<ParaLine> {
+fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primaries: &[Resolved], variation_ids: &[u32], para: &ParagraphStyle, width: Option<f32>) -> Vec<ParaLine> {
     let rtl_para = para.rtl == Some(true);
     let margins_for = |first: bool| -> (f32, f32) {
         let fi = if first { para.indent_first } else { 0.0 };
@@ -697,10 +697,6 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
     }
     // advance per char byte (cluster start)
     let mut char_adv = vec![0.0f32; text.len() + 1];
-    let mut variation_ids = vec![0u32; runs.len()];
-    for (i, (_, style)) in runs.iter().enumerate() {
-        variation_ids[i] = crate::variable::intern(&style.variations);
-    }
     for it in &items {
         for g in &it.glyphs {
             char_adv[g.cluster.min(text.len())] += g.adv + g.pre;
@@ -709,9 +705,9 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
     // Prefix widths and the preceding non-whitespace boundary make candidate line widths O(1).
     // Every-line composition evaluates O(n²) candidate breaks; summing each candidate's bytes
     // or rescanning its trailing whitespace would otherwise add another factor of text length.
-    let mut prefix_adv = vec![0.0f32; text.len() + 1];
+    let mut prefix_adv = vec![0.0f64; text.len() + 1];
     for i in 0..text.len() {
-        prefix_adv[i + 1] = prefix_adv[i] + char_adv[i];
+        prefix_adv[i + 1] = prefix_adv[i] + f64::from(char_adv[i]);
     }
     let mut previous_non_ws = vec![0usize; text.len() + 1];
     let mut non_ws_end = 0usize;
@@ -722,10 +718,10 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
         }
         previous_non_ws[b + c.len_utf8()] = non_ws_end;
     }
-    let range_w = |r: Range<usize>| -> f32 { prefix_adv[r.end] - prefix_adv[r.start] };
+    let range_w = |r: Range<usize>| -> f32 { (prefix_adv[r.end] - prefix_adv[r.start]) as f32 };
     let trailing_ws = |r: &Range<usize>| -> (usize, f32) {
         let end = previous_non_ws[r.end].max(r.start).min(r.end);
-        (end, prefix_adv[r.end] - prefix_adv[end])
+        (end, (prefix_adv[r.end] - prefix_adv[end]) as f32)
     };
     // Hanging punctuation widths (left, right) of a line's content.
     let hang_of = |r: &Range<usize>, ce: usize| -> (f32, f32) {
@@ -836,8 +832,10 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
         let mut underline: Option<(f32, f32)> = None;
         for run in vruns {
             let rtl = levels[run.start].is_rtl();
+            // Items are ordered and disjoint: binary-search both ends of the overlapping slice.
             let run_limit = items.partition_point(|item| item.range.start < run.end);
-            let mut idx: Vec<usize> = items[..run_limit].iter().enumerate().filter(|(_, item)| item.range.end > run.start).map(|(k, _)| k).collect();
+            let run_first = items[..run_limit].partition_point(|item| item.range.end <= run.start);
+            let mut idx: Vec<usize> = (run_first..run_limit).collect();
             if rtl {
                 idx.reverse();
             }
@@ -1004,11 +1002,29 @@ pub fn layout_rich_uncached(text: &str, runs: &[(Range<usize>, TextStyle)], para
     } else {
         runs
     };
+    // A location that cannot be interned would outline at the default; shape there too.
+    let cleared: Vec<(Range<usize>, TextStyle)>;
+    let runs = if runs.iter().any(|(_, s)| !s.variations.is_empty() && crate::variable::intern(&s.variations) == 0) {
+        cleared = runs
+            .iter()
+            .map(|(r, s)| {
+                let mut s = s.clone();
+                if crate::variable::intern(&s.variations) == 0 {
+                    s.variations.clear();
+                }
+                (r.clone(), s)
+            })
+            .collect();
+        &cleared[..]
+    } else {
+        runs
+    };
+    let variation_ids: Vec<u32> = runs.iter().map(|(_, s)| crate::variable::intern(&s.variations)).collect();
     let mut lay = Layout { missing_font: primaries.iter().any(|p| p.missing), text_len: text.len(), ..Default::default() };
     let mut plines: Vec<(usize, ParaLine)> = Vec::new();
     for (pi, span) in paragraph_ranges(text).enumerate() {
         let p = text.get(span.bytes.clone()).unwrap_or_default();
-        plines.extend(paragraph(p, span.bytes.start, runs, &primaries, para_at(pi), width).into_iter().map(|l| (pi, l)));
+        plines.extend(paragraph(p, span.bytes.start, runs, &primaries, &variation_ids, para_at(pi), width).into_iter().map(|l| (pi, l)));
     }
     let mut baseline = 0.0f32;
     for (i, (pi, pl)) in plines.into_iter().enumerate() {
@@ -1089,6 +1105,9 @@ pub fn layout(text: &str, style: &TextStyle, para: &ParagraphStyle) -> Arc<Layou
 
 /// [`layout_rich_uncached`], cached by text, runs and paragraph settings.
 pub fn layout_rich(text: &str, runs: &[(Range<usize>, TextStyle)], paras: &[ParagraphStyle]) -> Arc<Layout> {
+    if text.len() > MAX_LAYOUT_BYTES || runs.len() > MAX_LAYOUT_BYTES || paras.len() > MAX_LAYOUT_BYTES {
+        return Arc::new(layout_rich_uncached(text, runs, paras));
+    }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut h);
     runs.hash(&mut h);
@@ -1096,9 +1115,6 @@ pub fn layout_rich(text: &str, runs: &[(Range<usize>, TextStyle)], paras: &[Para
     let key = h.finish();
     static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if text.len() > MAX_LAYOUT_BYTES || runs.len() > MAX_LAYOUT_BYTES || paras.len() > MAX_LAYOUT_BYTES {
-        return Arc::new(layout_rich_uncached(text, runs, paras));
-    }
     if let Some(e) = cache().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&key) {
         e.0 = now;
         return e.1.clone();
